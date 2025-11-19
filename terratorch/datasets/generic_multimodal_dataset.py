@@ -5,6 +5,7 @@
 
 import glob
 import logging
+import random
 import warnings
 import os
 import re
@@ -93,7 +94,6 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
         scalar_label: bool = False,
         data_with_sample_dim: bool = False,
         concat_bands: bool = False,
-        prediction_mode: bool = False,
         *args,
         **kwargs,
     ) -> None:
@@ -103,7 +103,7 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
             data_root (dict[Path]): Dictionary of paths to data root directory or csv/parquet files with image-level
                 data, with modalities as keys.
             label_data_root (Path, optional): Path to data root directory with labels or csv/parquet files with
-                image-level labels. Needs to be specified for supervised tasks.
+                image-level labels. Needs to be specified for supervised tasks. Set to None for prediction mode.
             image_grep (dict[str], optional): Dictionary with regular expression appended to data_root to find input
                 images, with modalities as keys. Defaults to "*". Ignored when allow_substring_file_names is False.
             label_grep (str, optional): Regular expression appended to label_data_root to find labels or mask files.
@@ -119,7 +119,6 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
             rgb_modality (str, optional): Modality used for RGB plots. Defaults to first modality in data_root.keys().
             rgb_indices (list[str], optional): Indices of RGB channels. Defaults to [0, 1, 2].
             allow_missing_modalities (bool, optional): Allow missing modalities during data loading. Defaults to False.
-                TODO: Currently not implemented on a data module level!
             allow_substring_file_names (bool, optional): Allow substrings during sample identification by adding
                 image or label grep to the sample prefixes. If False, treats sample prefixes as full file names.
                 If True and no split file is provided, considers the file stem as prefix, otherwise the full file name.
@@ -153,26 +152,16 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
             concat_bands (bool): Concatenate all image modalities along the band dimension into a single "image", so
                 that it can be processed by single-modal models. Concatenate in the order of provided modalities.
                 Works with image modalities only. Does not work with allow_missing_modalities. Defaults to False.
-            prediction_mode (bool): Used to deactivate the checking for a label when it is not necessary.
         """
-
-        if prediction_mode:
-            label_data_root = None
-        else:
-            label_data_root = label_data_root or data_root
 
         super().__init__()
 
-        self.prediction_mode = prediction_mode
         self.split_file = split
         self.modalities = list(data_root.keys())
         assert "mask" not in self.modalities, "Modality cannot be called 'mask'."
         self.image_modalities = image_modalities or self.modalities
         self.non_image_modalities = list(set(self.modalities) - set(image_modalities))
         self.modalities = self.image_modalities + self.non_image_modalities  # Ensure image modalities to be first
-
-        if scalar_label:
-            self.non_image_modalities += ["label"]
 
         # Order by modalities and convert path strings to lists as the code expects a list of paths per modality
         data_root = {m: data_root[m] for m in self.modalities}
@@ -198,31 +187,35 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
             msg = "Please provide dataset_bands when expand_temporal_dimension is True"
             raise Exception(msg)
 
+        if scalar_label:
+            self.non_image_modalities += ["label"]
+
         # Load samples based on split file
         if self.split_file is not None:
-            if str(self.split_file).endswith(".txt"):
+            if not os.path.isfile(self.split_file):
+                raise FileNotFoundError(f"Split file {self.split_file} does not exist.")
+            elif str(self.split_file).endswith(".txt"):
                 with open(self.split_file) as f:
                     split = f.readlines()
                 valid_files = [rf"{substring.strip()}" for substring in split]
             else:
                 valid_files = list(load_table_data(self.split_file).index)
+            if len(valid_files) == 0:
+                raise ValueError(f"No sample candidates (file prefixes) found in split file {self.split_file}.")
 
         else:
             image_files = {}
             for m, m_paths in data_root.items():
                 image_files[m] = sorted(glob.glob(os.path.join(m_paths, image_grep[m])))
-            if label_data_root is not None:
-                image_files["mask"] = sorted(glob.glob(os.path.join(label_data_root, label_grep)))
 
             def get_file_id(file_name, mod):
                 glob_as_regex = '^' + ''.join('(.*?)' if ch == '*' else re.escape(ch)
                                               for ch in image_grep[mod]) + '$'
-                stem = re.match(glob_as_regex, file_name).group(1)
+                stem = re.match(glob_as_regex, os.path.basename(file_name)).group(1)
                 if allow_substring_file_names:
                     # Remove file extensions
                     stem = os.path.splitext(stem)[0]
-                # Remote folder structure
-                return os.path.basename(stem)
+                return stem
 
             if allow_missing_modalities:
                 valid_files = list(set([get_file_id(file, mod)
@@ -234,9 +227,17 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
 
         self.samples = []
         num_modalities = len(self.modalities) + int(label_data_root is not None)
+        if len(valid_files) == 0:
+            # Provide additional information if no candidates are found
+            image_files = {m: f[:3] for m, f in image_files.items()}
+            raise ValueError(f"No sample candidates (file prefixes) found for multimodal dataset. "
+                             f"Please review files and parameters.\n"
+                             f"data_root: {data_root}\n"
+                             f"image_grep: {image_grep}\n"
+                             f"allow_missing_modalities: {allow_missing_modalities}\n"
+                             f"File examples in data_root: {image_files}\n")
 
         # Check for parquet and csv files with modality data and read the file
-
         for m, m_path in data_root.items():
             if os.path.isfile(m_path):
                 data_root[m] = load_table_data(m_path)
@@ -253,6 +254,7 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
                                   f"The keys {valid_files[:3] + ['...']} are not in the index.")
 
         # Iterate over all files in split
+        failed_candidates = []
         for file in valid_files:
             sample = {}
             # Iterate over all modalities
@@ -262,9 +264,13 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
                     sample[m] = m_path.loc[file].values
                 elif allow_substring_file_names:
                     # Substring match with image_grep
-                    m_files = glob.glob(os.path.join(m_path, file + image_grep[m]))
+                    m_files = sorted(glob.glob(os.path.join(m_path, file + image_grep[m])))
                     if m_files:
-                        sample[m] = m_files[0]
+                        sample[m] = m_files[-1]
+                        if len(m_files) > 1:
+                            warnings.warn(f"Found multiple matching files for sample {file} and grep {image_grep[m]}: "
+                                          f"{m_files}. Selecting last one. "
+                                          f"Consider changing data structure or parameters for unique selection.")
                 else:
                     # Exact match
                     file_path = os.path.join(m_path, file)
@@ -277,9 +283,9 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
                     sample["mask"] = label_data_root.loc[file].values
                 elif allow_substring_file_names:
                     # Substring match with label_grep
-                    l_files = glob.glob(os.path.join(label_data_root, file + label_grep))
+                    l_files = sorted(glob.glob(os.path.join(label_data_root, file + label_grep)))
                     if l_files:
-                        sample["mask"] = l_files[0]
+                        sample["mask"] = l_files[-1]
                 else:
                     # Exact match
                     file_path = os.path.join(label_data_root, file)
@@ -287,10 +293,23 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
                         sample["mask"] = file_path
                 if "mask" not in sample:
                     # Only add sample if mask is present
-                    break
+                    failed_candidates.append(sample)
+                    continue
 
             if len(sample) == num_modalities or allow_missing_modalities:
                 self.samples.append(sample)
+            else:
+                failed_candidates.append(sample)
+
+        if len(self.samples) == 0:
+            # Provide additional information if no multi-modal samples are found
+            idx = random.sample(range(len(valid_files)), min(5, len(valid_files)))
+            raise ValueError(f"No samples found for multimodal dataset. Please review files, path, and grep params.\n"
+                             f"data_root: {data_root}\n"
+                             f"image_grep: {image_grep}\n"
+                             f"allow_missing_modalities: {allow_missing_modalities}\n"
+                             f"Candidate prefixes: {', '.join([valid_files[i] for i in idx])}\n"
+                             f"Sample candidate paths: {', '.join([failed_candidates[i] for i in idx])}")
 
         self.rgb_modality = rgb_modality or self.modalities[0]
         self.rgb_indices = rgb_indices or [0, 1, 2]
@@ -341,6 +360,7 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
         import rasterio
 
         warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarning)
+        warnings.filterwarnings("ignore", message="Dataset has no geotransform")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -381,6 +401,9 @@ class GenericMultimodalDataset(NonGeoDataset, ABC):
 
             if modality in self.constant_scale:
                 data = data.astype(np.float32) * self.constant_scale[modality]
+
+            if data.dtype == np.float64:
+                data = data.astype(np.float32)
 
             output[modality] = data
 
@@ -524,7 +547,6 @@ class GenericMultimodalSegmentationDataset(GenericMultimodalDataset):
         reduce_zero_label: bool = False,
         channel_position: int = -3,
         concat_bands: bool = False,
-        prediction_mode: bool = False,
         *args,
         **kwargs,
     ) -> None:
@@ -534,7 +556,7 @@ class GenericMultimodalSegmentationDataset(GenericMultimodalDataset):
             data_root (dict[Path]): Dictionary of paths to data root directory or csv/parquet files with image-level
                 data, with modalities as keys.
             num_classes (int): Number of classes.
-            label_data_root (Path): Path to data root directory with mask files.
+            label_data_root (Path): Path to data root directory with mask files. Set to None for prediction mode.
             image_grep (dict[str], optional): Dictionary with regular expression appended to data_root to find input
                 images, with modalities as keys. Defaults to "*". Ignored when allow_substring_file_names is False.
             label_grep (str, optional): Regular expression appended to label_data_root to find mask files.
@@ -550,7 +572,6 @@ class GenericMultimodalSegmentationDataset(GenericMultimodalDataset):
             rgb_modality (str, optional): Modality used for RGB plots. Defaults to first modality in data_root.keys().
             rgb_indices (list[str], optional): Indices of RGB channels. Defaults to [0, 1, 2].
             allow_missing_modalities (bool, optional): Allow missing modalities during data loading. Defaults to False.
-                TODO: Currently not implemented on a data module level!
             allow_substring_file_names (bool, optional): Allow substrings during sample identification by adding
                 image or label grep to the sample prefixes. If False, treats sample prefixes as full file names.
                 If True and no split file is provided, considers the file stem as prefix, otherwise the full file name.
@@ -584,7 +605,6 @@ class GenericMultimodalSegmentationDataset(GenericMultimodalDataset):
             concat_bands (bool): Concatenate all image modalities along the band dimension into a single "image", so
                 that it can be processed by single-modal models. Concatenate in the order of provided modalities.
                 Works with image modalities only. Does not work with allow_missing_modalities. Defaults to False.
-            prediction_mode (bool): Used to deactivate the checking for a label when it is not necessary.
         """
 
         super().__init__(
@@ -608,7 +628,6 @@ class GenericMultimodalSegmentationDataset(GenericMultimodalDataset):
             reduce_zero_label=reduce_zero_label,
             channel_position=channel_position,
             concat_bands=concat_bands,
-            prediction_mode=prediction_mode,
             *args,
             **kwargs,
         )
@@ -618,7 +637,7 @@ class GenericMultimodalSegmentationDataset(GenericMultimodalDataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         item = super().__getitem__(index)
 
-        if not self.prediction_mode:
+        if "mask" in item:
             item["mask"] = item["mask"].long()
 
         return item
@@ -735,7 +754,6 @@ class GenericMultimodalPixelwiseRegressionDataset(GenericMultimodalDataset):
         reduce_zero_label: bool = False,
         channel_position: int = -3,
         concat_bands: bool = False,
-        prediction_mode: bool = False,
         *args,
         **kwargs,
     ) -> None:
@@ -744,7 +762,7 @@ class GenericMultimodalPixelwiseRegressionDataset(GenericMultimodalDataset):
         Args:
             data_root (dict[Path]): Dictionary of paths to data root directory or csv/parquet files with image-level
                 data, with modalities as keys.
-            label_data_root (Path): Path to data root directory with ground truth files.
+            label_data_root (Path): Path to data root directory with ground truth files. Set to None for predictions.
             image_grep (dict[str], optional): Dictionary with regular expression appended to data_root to find input
                 images, with modalities as keys. Defaults to "*". Ignored when allow_substring_file_names is False.
             label_grep (str, optional): Regular expression appended to label_data_root to find ground truth files.
@@ -760,7 +778,6 @@ class GenericMultimodalPixelwiseRegressionDataset(GenericMultimodalDataset):
             rgb_modality (str, optional): Modality used for RGB plots. Defaults to first modality in data_root.keys().
             rgb_indices (list[str], optional): Indices of RGB channels. Defaults to [0, 1, 2].
             allow_missing_modalities (bool, optional): Allow missing modalities during data loading. Defaults to False.
-                TODO: Currently not implemented on a data module level!
             allow_substring_file_names (bool, optional): Allow substrings during sample identification by adding
                 image or label grep to the sample prefixes. If False, treats sample prefixes as full file names.
                 If True and no split file is provided, considers the file stem as prefix, otherwise the full file name.
@@ -791,7 +808,6 @@ class GenericMultimodalPixelwiseRegressionDataset(GenericMultimodalDataset):
             concat_bands (bool): Concatenate all image modalities along the band dimension into a single "image", so
                 that it can be processed by single-modal models. Concatenate in the order of provided modalities.
                 Works with image modalities only. Does not work with allow_missing_modalities. Defaults to False.
-            prediction_mode (bool): Used to deactivate the checking for a label when it is not necessary.
         """
 
         super().__init__(
@@ -815,7 +831,6 @@ class GenericMultimodalPixelwiseRegressionDataset(GenericMultimodalDataset):
             reduce_zero_label=reduce_zero_label,
             channel_position=channel_position,
             concat_bands=concat_bands,
-            prediction_mode=prediction_mode,
             *args,
             **kwargs,
         )
@@ -823,7 +838,7 @@ class GenericMultimodalPixelwiseRegressionDataset(GenericMultimodalDataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         item = super().__getitem__(index)
 
-        if not self.prediction_mode:
+        if "mask" in item:
             item["mask"] = item["mask"].float()
 
         return item
@@ -930,7 +945,6 @@ class GenericMultimodalScalarDataset(GenericMultimodalDataset):
         reduce_zero_label: bool = False,
         channel_position: int = -3,
         concat_bands: bool = False,
-        prediction_mode: bool = False,
         *args,
         **kwargs,
     ) -> None:
@@ -941,6 +955,7 @@ class GenericMultimodalScalarDataset(GenericMultimodalDataset):
                 data, with modalities as keys.
             num_classes (int): Number of classes.
             label_data_root (Path, optional): Path to data root directory with labels or csv/parquet files with labels.
+                Set to None for prediction mode.
             image_grep (dict[str], optional): Dictionary with regular expression appended to data_root to find input
                 images, with modalities as keys. Defaults to "*". Ignored when allow_substring_file_names is False.
             label_grep (str, optional): Regular expression appended to label_data_root to find labels files.
@@ -956,7 +971,6 @@ class GenericMultimodalScalarDataset(GenericMultimodalDataset):
             rgb_modality (str, optional): Modality used for RGB plots. Defaults to first modality in data_root.keys().
             rgb_indices (list[str], optional): Indices of RGB channels. Defaults to [0, 1, 2].
             allow_missing_modalities (bool, optional): Allow missing modalities during data loading. Defaults to False.
-                TODO: Currently not implemented on a data module level!
             allow_substring_file_names (bool, optional): Allow substrings during sample identification by adding
                 image or label grep to the sample prefixes. If False, treats sample prefixes as full file names.
                 If True and no split file is provided, considers the file stem as prefix, otherwise the full file name.
@@ -990,7 +1004,6 @@ class GenericMultimodalScalarDataset(GenericMultimodalDataset):
             concat_bands (bool): Concatenate all image modalities along the band dimension into a single "image", so
                 that it can be processed by single-modal models. Concatenate in the order of provided modalities.
                 Works with image modalities only. Does not work with allow_missing_modalities. Defaults to False.
-            prediction_mode (bool): Used to deactivate the checking for a label when it is not necessary.
         """
 
         super().__init__(
@@ -1015,7 +1028,6 @@ class GenericMultimodalScalarDataset(GenericMultimodalDataset):
             channel_position=channel_position,
             scalar_label=True,
             concat_bands=concat_bands,
-            prediction_mode=prediction_mode,
             *args,
             **kwargs,
         )

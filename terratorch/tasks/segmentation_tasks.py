@@ -1,13 +1,11 @@
-import warnings
-from typing import Any
-from functools import partial
-import os
+
 import logging
-import lightning
+import warnings
+from functools import partial
+from typing import Any
 import matplotlib.pyplot as plt
 import segmentation_models_pytorch as smp
 import torch
-from lightning.pytorch.callbacks import Callback
 from torch import Tensor, nn
 from torchgeo.datasets.utils import unbind_samples
 from torchmetrics import ClasswiseWrapper, MetricCollection
@@ -15,12 +13,12 @@ from torchmetrics.classification import MulticlassAccuracy, MulticlassF1Score, M
 
 from terratorch.models.model import AuxiliaryHead, ModelOutput
 from terratorch.registry import MODEL_FACTORY_REGISTRY
-from terratorch.tasks.loss_handler import LossHandler
-from terratorch.tasks.optimizer_factory import optimizer_factory
-from terratorch.tasks.tiled_inference import TiledInferenceParameters, tiled_inference
 from terratorch.tasks.base_task import TerraTorchTask
 from terratorch.models.model import ModelOutput
 import pdb
+from terratorch.tasks.loss_handler import LossHandler, CombinedLoss
+from terratorch.tasks.tiled_inference import tiled_inference
+from terratorch.tasks.metrics import BoundaryMeanIoU
 
 BATCH_IDX_FOR_VALIDATION_PLOTTING = 10
 
@@ -30,6 +28,26 @@ logger = logging.getLogger("terratorch")
 def to_segmentation_prediction(y: ModelOutput) -> Tensor:
     y_hat = y.output
     return y_hat.argmax(dim=1)
+
+def init_loss(loss: str, ignore_index: int = None, class_weights: list = None) -> nn.Module:
+    if loss == "ce":
+        return nn.CrossEntropyLoss(ignore_index=ignore_index, weight=class_weights)
+    elif loss == "jaccard":
+        if ignore_index is not None:
+            raise RuntimeError(
+                f"Jaccard loss does not support ignore_index, but found non-None value of {ignore_index}."
+            )
+        return smp.losses.JaccardLoss(mode="multiclass")
+    elif loss == "focal":
+        return smp.losses.FocalLoss("multiclass", ignore_index=ignore_index, normalized=True)
+    elif loss == "dice":
+        return smp.losses.DiceLoss("multiclass", ignore_index=ignore_index)
+    elif loss == "lovasz":
+        return smp.losses.LovaszLoss(mode="multiclass", ignore_index=ignore_index)
+    else:
+        raise ValueError(
+            f"Loss type '{loss}' is not valid. Currently, supports 'ce', 'jaccard', 'dice', 'focal', or 'lovasz' loss."
+        )
 
 
 class SemanticSegmentationTask(TerraTorchTask):
@@ -49,7 +67,7 @@ class SemanticSegmentationTask(TerraTorchTask):
         model_args: dict,
         model_factory: str | None = None,
         model: torch.nn.Module | None = None,
-        loss: str = "ce",
+        loss: str | list[str] | dict[str, float] = "ce",
         aux_heads: list[AuxiliaryHead] | None = None,
         aux_loss: dict[str, float] | None = None,
         class_weights: list[float] | None = None,
@@ -60,10 +78,9 @@ class SemanticSegmentationTask(TerraTorchTask):
         optimizer_hparams: dict | None = None,
         scheduler: str | None = None,
         scheduler_hparams: dict | None = None,
-        #
         freeze_backbone: bool = False,  # noqa: FBT001, FBT002
         freeze_decoder: bool = False,  # noqa: FBT002, FBT001
-        freeze_head: bool = False, 
+        freeze_head: bool = False,
         plot_on_val: bool | int = 10,
         class_names: list[str] | None = None,
         tiled_inference_parameters: dict = None,
@@ -73,17 +90,18 @@ class SemanticSegmentationTask(TerraTorchTask):
         output_most_probable: bool = True,
         path_to_record_metrics: str = None,
         tiled_inference_on_testing: bool = False,
+        tiled_inference_on_validation: bool = False,
     ) -> None:
         """Constructor
 
         Args:
-            Defaults to None.
             model_args (Dict): Arguments passed to the model factory.
             model_factory (str, optional): ModelFactory class to be used to instantiate the model.
                 Is ignored when model is provided.
             model (torch.nn.Module, optional): Custom model.
-            loss (str, optional): Loss to be used. Currently, supports 'ce', 'jaccard' or 'focal' loss.
-                Defaults to "ce".
+            loss (str | list[str] | dict[str, float], optional): Loss to be used. Single loss as string.
+                Multiple losses can be provided as list of strings or as dict with float values defining loss weights.
+                Currently, supports 'ce', 'jaccard', 'dice', 'lovasz', or 'focal' loss. Defaults to "ce".
             aux_loss (dict[str, float] | None, optional): Auxiliary loss weights.
                 Should be a dictionary where the key is the name given to the loss
                 and the value is the weight to be applied to that loss.
@@ -121,9 +139,9 @@ class SemanticSegmentationTask(TerraTorchTask):
             output_on_inference (str | list[str]): A string or a list defining the kind of output to be saved to file during the inference, for example,
                 it can be "prediction", to save just the most probable class, or ["prediction", "probabilities"] to save both prediction and probabilities.
             output_most_probable (bool): A boolean to define if the prediction step will output just the most probable logit or all of them.
-                This argument has been deprecated and will be replaced with `output_on_inference`. 
-            tiled_inference_on_testing (bool): A boolean to define if tiled inference will be used when full inference 
-                fails during the test step. 
+                This argument has been deprecated and will be replaced with `output_on_inference`.
+            tiled_inference_on_testing (bool): A boolean to define if tiled inference will be used during the test step.
+            tiled_inference_on_validation (bool): A boolean to define if tiled inference will be used during the val step.
             path_to_record_metrics (str): A path to save the file containing the metrics log. 
         """
 
@@ -139,8 +157,12 @@ class SemanticSegmentationTask(TerraTorchTask):
         if model_factory and model is None:
             self.model_factory = MODEL_FACTORY_REGISTRY.build(model_factory)
 
-        super().__init__(task="segmentation", tiled_inference_on_testing=tiled_inference_on_testing,
-                         path_to_record_metrics=path_to_record_metrics)
+        super().__init__(
+            task="segmentation",
+            tiled_inference_on_testing=tiled_inference_on_testing,
+            tiled_inference_on_validation=tiled_inference_on_validation,
+            path_to_record_metrics=path_to_record_metrics,
+        )
 
         if model is not None:
             # Custom model
@@ -158,7 +180,10 @@ class SemanticSegmentationTask(TerraTorchTask):
         # When the user decides to use `output_most_probable` as `False` in
         # order to output the probabilities instead of the prediction.
         if not output_most_probable:
-            warnings.warn("The argument `output_most_probable` is deprecated and will be replaced with `output_on_inference='probabilities'`.", stacklevel=1)
+            warnings.warn(
+                "The argument `output_most_probable` is deprecated and will be replaced with `output_on_inference='probabilities'`.",
+                stacklevel=1,
+            )
             output_on_inference = "probabilities"
 
         # Processing the `output_on_inference` argument.
@@ -168,10 +193,10 @@ class SemanticSegmentationTask(TerraTorchTask):
 
         # The possible methods to define outputs.
         self.operation_map = {
-                              "prediction": self.output_prediction, 
-                              "logits": self.output_logits, 
-                              "probabilities": self.output_probabilities
-                              }
+            "prediction": self.output_prediction,
+            "logits": self.output_logits,
+            "probabilities": self.output_probabilities,
+        }
 
         # `output_on_inference` can be a list or a string.
         if isinstance(output_on_inference, list):
@@ -180,18 +205,24 @@ class SemanticSegmentationTask(TerraTorchTask):
                 if var in self.operation_map:
                     list_of_selectors += (self.operation_map[var],)
                 else:
-                    raise ValueError(f"Option {var} is not supported. It must be in ['prediction', 'logits', 'probabilities']")
+                    raise ValueError(
+                        f"Option {var} is not supported. It must be in ['prediction', 'logits', 'probabilities']"
+                    )
 
             if not len(list_of_selectors):
-                raise ValueError("The list of selectors for the output is empty, please, provide a valid value for `output_on_inference`")
+                raise ValueError(
+                    "The list of selectors for the output is empty, please, provide a valid value for `output_on_inference`"
+                )
 
-            self.select_classes = lambda y: [op(y) for op in
-                                                   list_of_selectors]
+            self.select_classes = lambda y: [op(y) for op in list_of_selectors]
         elif isinstance(output_on_inference, str):
             self.select_classes = self.operation_map[output_on_inference]
 
         else:
             raise ValueError(f"The value {output_on_inference} isn't supported for `output_on_inference`.")
+
+    def squeeze_ground_truth(self, x):
+        return torch.squeeze(x, 1)
 
     def configure_losses(self) -> None:
         """Initialize the loss criterion.
@@ -199,31 +230,33 @@ class SemanticSegmentationTask(TerraTorchTask):
         Raises:
             ValueError: If *loss* is invalid.
         """
-        loss: str = self.hparams["loss"]
+        loss = self.hparams["loss"]
         ignore_index = self.hparams["ignore_index"]
 
         class_weights = (
             torch.Tensor(self.hparams["class_weights"]) if self.hparams["class_weights"] is not None else None
         )
-        if loss == "ce":
-            ignore_value = -100 if ignore_index is None else ignore_index
-            self.criterion = nn.CrossEntropyLoss(ignore_index=ignore_value, weight=class_weights)
-        elif loss == "jaccard":
-            if ignore_index is not None:
-                exception_message = (
-                    f"Jaccard loss does not support ignore_index, but found non-None value of {ignore_index}."
-                )
-                raise RuntimeError(exception_message)
-            self.criterion = smp.losses.JaccardLoss(mode="multiclass")
-        elif loss == "focal":
-            self.criterion = smp.losses.FocalLoss("multiclass", ignore_index=ignore_index, normalized=True)
-        elif loss == "dice":
-            self.criterion = smp.losses.DiceLoss("multiclass", ignore_index=ignore_index)
+
+        if isinstance(loss, str):
+            # Single loss
+            self.criterion = init_loss(loss, ignore_index=ignore_index, class_weights=class_weights)
+        elif isinstance(loss, nn.Module):
+            # Custom loss
+            self.criterion = loss
+        elif isinstance(loss, list):
+            # List of losses with equal weights
+            losses = {loss: init_loss(loss, ignore_index=ignore_index, class_weights=class_weights)
+                      for loss in loss}
+            self.criterion = CombinedLoss(losses=losses)
+        elif isinstance(loss, dict):
+            # Equal weighting of losses
+            loss, weight = list(loss.keys()), list(loss.values())
+            losses = {loss: init_loss(loss, ignore_index=ignore_index, class_weights=class_weights)
+                      for loss in loss}
+            self.criterion = CombinedLoss(losses=losses, weight=weight)
         else:
-            exception_message = (
-                f"Loss type '{loss}' is not valid. Currently, supports 'ce', 'jaccard', 'dice' or 'focal' loss."
-            )
-            raise ValueError(exception_message)
+            raise ValueError(f"The loss type {loss} isn't supported. Provide loss as string, list, or "
+                             f"dict[name, weights].")
 
     def configure_metrics(self) -> None:
         """Initialize the performance metrics."""
@@ -257,13 +290,17 @@ class SemanticSegmentationTask(TerraTorchTask):
                     ignore_index=ignore_index,
                     average="micro",
                 ),
+                "Boundary_mIoU": BoundaryMeanIoU(
+                    num_classes=num_classes,
+                    thickness=2,
+                    ignore_index=ignore_index,
+                    average="macro",
+                    include_background=False,
+                ),
                 "IoU": ClasswiseWrapper(
-                    MulticlassJaccardIndex(
-                        num_classes=num_classes,
-                        ignore_index=ignore_index,
-                        average=None
-                    ),
+                    MulticlassJaccardIndex(num_classes=num_classes, ignore_index=ignore_index, average=None),
                     labels=class_names,
+                    prefix="IoU_",
                 ),
                 "Class_Accuracy": ClasswiseWrapper(
                     MulticlassAccuracy(
@@ -272,6 +309,7 @@ class SemanticSegmentationTask(TerraTorchTask):
                         average=None,
                     ),
                     labels=class_names,
+                    prefix="Class_Accuracy_",
                 ),
             }
         )
@@ -292,6 +330,7 @@ class SemanticSegmentationTask(TerraTorchTask):
         
         return y
     
+    
     def training_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Tensor:
         """Compute the train loss and additional metrics.
 
@@ -304,6 +343,7 @@ class SemanticSegmentationTask(TerraTorchTask):
         x = batch["image"]
         y = batch["mask"]
         y = self.reformat_y(y)
+        y = self.squeeze_ground_truth(batch["mask"])
         other_keys = batch.keys() - {"image", "mask", "filename"}
 
         rest = {k: batch[k] for k in other_keys}
@@ -326,11 +366,13 @@ class SemanticSegmentationTask(TerraTorchTask):
         x = batch["image"]
         y = batch["mask"]
         y = self.reformat_y(y)
+        y = self.squeeze_ground_truth(batch["mask"])
         other_keys = batch.keys() - {"image", "mask", "filename"}
+        
         
         rest = {k: batch[k] for k in other_keys}
 
-        model_output = self.handle_full_or_tiled_inference(x, self.hparams["model_args"]["num_classes"], **rest)
+        model_output = self.handle_full_or_tiled_inference(x, self.tiled_inference_on_testing, **rest)
 
         if dataloader_idx >= len(self.test_loss_handler):
             msg = "You are returning more than one test dataloader but not defining enough test_dataloaders_names."
@@ -356,10 +398,13 @@ class SemanticSegmentationTask(TerraTorchTask):
         x = batch["image"]
         y = batch["mask"]
         y = self.reformat_y(y)
+        y = self.squeeze_ground_truth(batch["mask"])
 
         other_keys = batch.keys() - {"image", "mask", "filename"}
         rest = {k: batch[k] for k in other_keys}
         model_output: ModelOutput = self(x, **rest)
+        model_output = self.handle_full_or_tiled_inference(x, self.tiled_inference_on_validation, **rest)
+
         loss = self.val_loss_handler.compute_loss(model_output, y, self.criterion, self.aux_loss)
         self.val_loss_handler.log_loss(self.log, loss_dict=loss, batch_size=y.shape[0])
         y_hat_hard = to_segmentation_prediction(model_output)
@@ -371,13 +416,13 @@ class SemanticSegmentationTask(TerraTorchTask):
                 batch["prediction"] = y_hat_hard
 
                 if isinstance(batch["image"], dict):
-                    rgb_modality = getattr(datamodule, 'rgb_modality', None) or list(batch["image"].keys())[0]
+                    rgb_modality = getattr(datamodule, "rgb_modality", None) or list(batch["image"].keys())[0]
                     batch["image"] = batch["image"][rgb_modality]
 
                 for key in ["image", "mask", "prediction"]:
                     batch[key] = batch[key].cpu()
                 sample = unbind_samples(batch)[0]
-                fig = datamodule.val_dataset.plot(sample)
+                fig = datamodule.val_dataset.plot(sample) if hasattr(datamodule.val_dataset, "plot") else datamodule.plot(sample, "val") 
                 if fig:
                     summary_writer = self.logger.experiment
                     if hasattr(summary_writer, "add_figure"):
@@ -386,6 +431,8 @@ class SemanticSegmentationTask(TerraTorchTask):
                         summary_writer.log_figure(
                             self.logger.run_id, fig, f"epoch_{self.current_epoch}_{batch_idx}.png"
                         )
+                    else:
+                        plt.savefig("/mnt/geobench/data/geobench_experiments/final_again/test_plots")
             except ValueError:
                 pass
             finally:
@@ -408,7 +455,7 @@ class SemanticSegmentationTask(TerraTorchTask):
 
         rest = {k: batch[k] for k in other_keys}
 
-        def model_forward(x,  **kwargs):
+        def model_forward(x, **kwargs):
             return self(x, **kwargs).output
 
         if self.tiled_inference_parameters:

@@ -18,7 +18,7 @@ from torchmetrics.wrappers.abstract import WrapperMetric
 
 from terratorch.models.model import AuxiliaryHead, Model, ModelOutput
 from terratorch.registry.registry import MODEL_FACTORY_REGISTRY
-from terratorch.tasks.loss_handler import LossHandler
+from terratorch.tasks.loss_handler import LossHandler, CombinedLoss
 from terratorch.tasks.optimizer_factory import optimizer_factory
 from terratorch.tasks.tiled_inference import TiledInferenceParameters, tiled_inference
 from terratorch.tasks.base_task import TerraTorchTask
@@ -64,7 +64,7 @@ class IgnoreIndexLossWrapper(nn.Module):
         return loss * mask.float(), mask.sum() + eps
 
     def forward(self, output: Tensor, target: Tensor) -> Tensor:
-        loss: Tensor = self.loss_function(output, target)
+        loss: Tensor = self.loss_function(output, target.float())
         if self.ignore_index is not None:
             loss, norm_value = self._mask(loss, target)
         else:
@@ -102,6 +102,9 @@ class IgnoreIndexMetricWrapper(WrapperMetric):
             items_to_take[torch.isnan(target)] = False  # Filter NaN values as well
             target = target[items_to_take]
             preds = preds[items_to_take]
+        else:
+            preds = preds.flatten()
+            target = target.flatten()
         return self.metric.update(preds, target)
 
     def forward(self, preds: Tensor, target: Tensor, *args, **kwargs) -> Any:
@@ -122,6 +125,20 @@ class IgnoreIndexMetricWrapper(WrapperMetric):
         self.metric.reset()
 
 
+def init_loss(loss: str, ignore_index: int = None):
+    if loss == "mse":
+        return IgnoreIndexLossWrapper(nn.MSELoss(reduction="none"), ignore_index)
+    elif loss == "mae":
+        return  IgnoreIndexLossWrapper(nn.L1Loss(reduction="none"), ignore_index)
+    elif loss == "rmse":
+        # IMPORTANT! Root is done only after ignore index! Otherwise, the mean taken is incorrect
+        return  RootLossWrapper(IgnoreIndexLossWrapper(nn.MSELoss(reduction="none"), ignore_index), reduction=None)
+    elif loss == "huber":
+        return  IgnoreIndexLossWrapper(nn.HuberLoss(reduction="none"), ignore_index)
+    else:
+        raise ValueError(f"Loss type '{loss}' is not valid. Currently, supports 'mse', 'rmse', 'mae', or 'huber' loss.")
+
+
 class PixelwiseRegressionTask(TerraTorchTask):
     """Pixelwise Regression Task that accepts models from a range of sources.
 
@@ -138,7 +155,7 @@ class PixelwiseRegressionTask(TerraTorchTask):
         model_args: dict,
         model_factory: str | None = None,
         model: torch.nn.Module | None = None,
-        loss: str = "mse",
+        loss: str | list[str] | dict[str, float] = "mse",
         aux_heads: list[AuxiliaryHead] | None = None,
         aux_loss: dict[str, float] | None = None,
         class_weights: list[float] | None = None,
@@ -157,7 +174,8 @@ class PixelwiseRegressionTask(TerraTorchTask):
         tiled_inference_parameters: dict | None = None,
         test_dataloaders_names: list[str] | None = None,
         lr_overrides: dict[str, float] | None = None,
-        tiled_inference_on_testing: bool = None,
+        tiled_inference_on_testing: bool = False,
+        tiled_inference_on_validation: bool = False,
         path_to_record_metrics: str = None,
     ) -> None:
         """Constructor
@@ -167,8 +185,9 @@ class PixelwiseRegressionTask(TerraTorchTask):
             model_factory (str, optional): Name of ModelFactory class to be used to instantiate the model.
                 Is ignored when model is provided.
             model (torch.nn.Module, optional): Custom model.
-            loss (str, optional): Loss to be used. Currently, supports 'mse', 'rmse', 'mae' or 'huber' loss.
-                Defaults to "mse".
+            loss (str | list[str] | dict[str, float], optional): Loss to be used. Single loss as string.
+                Multiple losses can be provided as list of strings or as dict with float values defining loss weights.
+                Currently, supports 'mse', 'rmse', 'mae' or 'huber' loss. Defaults to "mse".
             aux_loss (dict[str, float] | None, optional): Auxiliary loss weights.
                 Should be a dictionary where the key is the name given to the loss
                 and the value is the weight to be applied to that loss.
@@ -200,8 +219,8 @@ class PixelwiseRegressionTask(TerraTorchTask):
             lr_overrides (dict[str, float] | None, optional): Dictionary to override the default lr in specific
                 parameters. The key should be a substring of the parameter names (it will check the substring is
                 contained in the parameter name)and the value should be the new lr. Defaults to None.
-            tiled_inference_on_testing (bool): A boolean to the fine if tiled inference will be used when full inference
-                fails during the test step.
+            tiled_inference_on_testing (bool): A boolean to define if tiled inference will be used during the test step. 
+            tiled_inference_on_validation (bool): A boolean to define if tiled inference will be used during the val step. 
             path_to_record_metrics (str): A path to save the file containing the metrics log.
         """
 
@@ -217,8 +236,12 @@ class PixelwiseRegressionTask(TerraTorchTask):
         if model_factory and model is None:
             self.model_factory = MODEL_FACTORY_REGISTRY.build(model_factory)
 
-        super().__init__(task="regression", tiled_inference_on_testing=tiled_inference_on_testing,
-                         path_to_record_metrics=path_to_record_metrics)
+        super().__init__(
+            task="regression", 
+            tiled_inference_on_testing=tiled_inference_on_testing,
+            tiled_inference_on_validation=tiled_inference_on_validation,
+            path_to_record_metrics=path_to_record_metrics
+            )
 
         if model:
             # Custom_model
@@ -238,23 +261,30 @@ class PixelwiseRegressionTask(TerraTorchTask):
         Raises:
             ValueError: If *loss* is invalid.
         """
-        loss: str = self.hparams["loss"].lower()
-        if loss == "mse":
-            self.criterion: nn.Module = IgnoreIndexLossWrapper(
-                nn.MSELoss(reduction="none"), self.hparams["ignore_index"]
-            )
-        elif loss == "mae":
-            self.criterion = IgnoreIndexLossWrapper(nn.L1Loss(reduction="none"), self.hparams["ignore_index"])
-        elif loss == "rmse":
-            # IMPORTANT! Root is done only after ignore index! Otherwise the mean taken is incorrect
-            self.criterion = RootLossWrapper(
-                IgnoreIndexLossWrapper(nn.MSELoss(reduction="none"), self.hparams["ignore_index"]), reduction=None
-            )
-        elif loss == "huber":
-            self.criterion = IgnoreIndexLossWrapper(nn.HuberLoss(reduction="none"), self.hparams["ignore_index"])
+        loss = self.hparams["loss"]
+        ignore_index = self.hparams["ignore_index"]
+
+        if isinstance(loss, str):
+            # Single loss
+            self.criterion = init_loss(loss, ignore_index=ignore_index)
+        elif isinstance(loss, nn.Module):
+            # Custom loss
+            self.criterion = loss
+        elif isinstance(loss, list):
+            # List of losses with equal weights
+            losses = {loss: init_loss(loss, ignore_index=ignore_index)
+                      for loss in loss}
+            self.criterion = CombinedLoss(losses=losses)
+        elif isinstance(loss, dict):
+            # Equal weighting of losses
+            loss, weight = list(loss.keys()), list(loss.values())
+            losses = {loss: init_loss(loss, ignore_index=ignore_index)
+                      for loss in loss}
+            self.criterion = CombinedLoss(losses=losses, weight=weight)
         else:
-            exception_message = f"Loss type '{loss}' is not valid. Currently, supports 'mse', 'rmse' or 'mae' loss."
-            raise ValueError(exception_message)
+            raise ValueError(f"The loss type {loss} isn't supported. Provide loss as string, list, or "
+                             f"dict[name, weights].")
+
 
     def configure_metrics(self) -> None:
         """Initialize the performance metrics."""
@@ -319,7 +349,9 @@ class PixelwiseRegressionTask(TerraTorchTask):
         y = batch["mask"]
         other_keys = batch.keys() - {"image", "mask", "filename"}
         rest = {k: batch[k] for k in other_keys}
-        model_output: ModelOutput = self(x, **rest)
+        model_output = self.handle_full_or_tiled_inference(x, self.tiled_inference_on_validation, **rest)
+        if self.tiled_inference_on_validation:
+            model_output.output =  torch.squeeze(model_output.output, 1)
         loss = self.val_loss_handler.compute_loss(model_output, y, self.criterion, self.aux_loss)
         self.val_loss_handler.log_loss(self.log, loss_dict=loss, batch_size=y.shape[0])
         y_hat = model_output.output
@@ -362,7 +394,9 @@ class PixelwiseRegressionTask(TerraTorchTask):
         other_keys = batch.keys() - {"image", "mask", "filename"}
         rest = {k: batch[k] for k in other_keys}
 
-        model_output = self.handle_full_or_tiled_inference(x, 1, **rest)
+        model_output = self.handle_full_or_tiled_inference(x, self.tiled_inference_on_testing, **rest)
+        if self.tiled_inference_on_testing:
+            model_output.output =  torch.squeeze(model_output.output, 1)
 
         if dataloader_idx >= len(self.test_loss_handler):
             msg = "You are returning more than one test dataloader but not defining enough test_dataloaders_names."

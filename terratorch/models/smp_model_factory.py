@@ -4,6 +4,7 @@ import importlib
 from collections.abc import Callable
 
 import segmentation_models_pytorch as smp
+import timm
 import torch
 import torch.nn.functional as F  # noqa: N812
 from segmentation_models_pytorch.encoders import encoders as smp_encoders
@@ -137,9 +138,11 @@ class SMPModelFactory(ModelFactory):
             msg = f"Decoder {model} is not supported in SMP."
             raise ValueError(msg)
 
-        backbone_kwargs, kwargs = extract_prefix_keys(kwargs, "backbone_")  # Encoder params should be prefixed backbone_
-        smp_kwargs, kwargs = extract_prefix_keys(backbone_kwargs, "smp_")  # Smp model params should be prefixed smp_
-        aux_params, kwargs = extract_prefix_keys(backbone_kwargs, "aux_")  # Auxiliary head params should be prefixed aux_
+        backbone_kwargs, kwargs = extract_prefix_keys(
+            kwargs, "backbone_"
+        )  # Encoder params should be prefixed backbone_
+        smp_kwargs, kwargs = extract_prefix_keys(kwargs, "smp_")  # Smp model params should be prefixed smp_
+        aux_params, kwargs = extract_prefix_keys(kwargs, "aux_")  # Auxiliary head params should be prefixed aux_
         aux_params = None if aux_params == {} else aux_params
 
         if isinstance(pretrained, bool):
@@ -150,31 +153,45 @@ class SMPModelFactory(ModelFactory):
 
         # If encoder not currently supported by SMP (custom encoder).
         if backbone not in smp_encoders:
-            # These params must be included in the config file with appropriate prefix.
-            required_params = {
-                "encoder_depth": smp_kwargs,
-                "out_channels": backbone_kwargs,
-                "output_stride": backbone_kwargs,
-            }
+            if backbone.startswith("tu-"):
+                # for timm encoders
+                timm_encoder = backbone[3:]
+                if timm_encoder not in timm.list_models(pretrained=True):
+                    raise ValueError(f"Backbone {timm_encoder} is not a valid pretrained timm model.")
 
-            for param, config_dict in required_params.items():
-                if param not in config_dict:
-                    msg = f"Config must include the '{param}' parameter"
-                    raise ValueError(msg)
+                model_args = {
+                    "encoder_name": backbone,
+                    "encoder_weights": pretrained,
+                    "in_channels": in_channels,
+                    "classes": num_classes,
+                    **smp_kwargs,
+                }
+            else:
+                # These params must be included in the config file with appropriate prefix.
+                required_params = {
+                    "encoder_depth": smp_kwargs,
+                    "out_channels": backbone_kwargs,
+                    "output_stride": backbone_kwargs,
+                }
 
-            # Using new encoder.
-            backbone_class = make_smp_encoder(backbone)
-            backbone_kwargs["prepare_features_for_image_model"] = prepare_features_for_image_model
-            # Registering custom encoder into SMP.
-            register_custom_encoder(backbone_class, backbone_kwargs, pretrained)
+                for param, config_dict in required_params.items():
+                    if param not in config_dict:
+                        msg = f"Config must include the '{param}' parameter"
+                        raise ValueError(msg)
 
-            model_args = {
-                "encoder_name": "SMPEncoderWrapperWithPFFIM",
-                "encoder_weights": pretrained,
-                "in_channels": in_channels,
-                "classes": num_classes,
-                **smp_kwargs,
-            }
+                # Using new encoder.
+                backbone_class = make_smp_encoder(backbone)
+                backbone_kwargs["prepare_features_for_image_model"] = prepare_features_for_image_model
+                # Registering custom encoder into SMP.
+                register_custom_encoder(backbone_class, backbone_kwargs, pretrained)
+
+                model_args = {
+                    "encoder_name": "SMPEncoderWrapperWithPFFIM",
+                    "encoder_weights": pretrained,
+                    "in_channels": in_channels,
+                    "classes": num_classes,
+                    **smp_kwargs,
+                }
         # Using SMP encoder.
         else:
             model_args = {

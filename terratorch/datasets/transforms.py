@@ -8,21 +8,35 @@ import albumentations as A
 import kornia.augmentation as K
 from kornia.augmentation._2d.geometric.base import GeometricAugmentationBase2D
 from torch import nn
+from typing import Union, Dict
 
 N_DIMS_FOR_TEMPORAL = 4
 N_DIMS_FLATTENED_TEMPORAL = 3
 
-def kornia_augmentations_to_callable_with_dict(augmentations: list[GeometricAugmentationBase2D] | None = None):
+def kornia_augmentations_to_callable_with_dict(augmentations: list[Union[GeometricAugmentationBase2D, K.VideoSequential]]  | None = None):
     if augmentations is None:
         return lambda x: x
-    augmentations = K.AugmentationSequential(
+    #if first augmentiaion is VideoSequential (multi-temporal), add the rest to video sequence 
+    if isinstance(augmentations[0], K.VideoSequential):
+        augmentations = K.AugmentationSequential(
+            K.VideoSequential(
+                *augmentations[1:],
+                data_format="BCTHW",
+                same_on_frame=True
+                ),
+                data_keys=None,
+                keepdim=True,
+            )
+    else:
+        augmentations = K.AugmentationSequential(
             *augmentations,
             data_keys=None,
             keepdim=True,
             )
     def fn(data):
-        return augmentations(**data)
+        return augmentations(data)
     return fn
+
 
 def albumentations_to_callable_with_dict(albumentation: list[BasicTransform] | None = None):
     if albumentation is None:
@@ -302,7 +316,7 @@ class MultimodalTransforms:
         """
         self.transforms = transforms
         self.shared = shared
-        self.non_image_modalities = non_image_modalities
+        self.non_image_modalities = non_image_modalities if non_image_modalities is not None else []
         self.non_image_transform = non_image_transform or default_non_image_transform
 
     def __call__(self, data: dict):

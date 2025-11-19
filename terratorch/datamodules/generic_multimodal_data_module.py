@@ -3,7 +3,7 @@
 """
 This module contains generic data modules for instantiation at runtime.
 """
-import os
+
 import logging
 import warnings
 from collections.abc import Callable, Iterable
@@ -169,19 +169,21 @@ class GenericMultiModalDataModule(NonGeoDataModule):
         self,
         batch_size: int,
         modalities: list[str],
-        train_data_root: dict[str, Path],
-        val_data_root: dict[str, Path],
-        test_data_root: dict[str, Path],
         means: dict[str, list],
         stds: dict[str, list],
         task: str | None = None,
         num_classes: int | None = None,
-        image_grep: str | dict[str, str] | None = None,
-        label_grep: str | None = None,
+        train_data_root: dict[str, Path] | str | None = None,
+        val_data_root: dict[str, Path] | str  | None = None,
+        test_data_root: dict[str, Path]  | str | None = None,
+        predict_data_root: dict[str, Path] | str | None = None,
+        data_root: dict[str, Path] | str | None = None,
         train_label_data_root: Path | str | None = None,
         val_label_data_root: Path | str | None = None,
         test_label_data_root: Path | str | None = None,
-        predict_data_root: dict[str, Path] | str | None = None,
+        label_data_root: Path | str | None = None,
+        image_grep: str | dict[str, str] | None = None,
+        label_grep: str | None = None,
         train_split: Path | str | None = None,
         val_split: Path | str | None = None,
         test_split: Path| str | None = None,
@@ -207,6 +209,7 @@ class GenericMultiModalDataModule(NonGeoDataModule):
         num_workers: int = 0,
         pin_memory: bool = False,
         data_with_sample_dim: bool = False,
+        allow_missing_modalities: bool = False,
         sample_num_modalities: int | None = None,
         sample_replace: bool = False,
         channel_position: int = -3,
@@ -219,30 +222,32 @@ class GenericMultiModalDataModule(NonGeoDataModule):
         Args:
             batch_size (int): Number of samples in per batch.
             modalities (list[str]): List of modalities.
-            train_data_root (dict[Path]): Dictionary of paths to training data root directory or csv/parquet files with 
-                image-level data, with modalities as keys.
-            val_data_root (dict[Path]): Dictionary of paths to validation data root directory or csv/parquet files with 
-                image-level data, with modalities as keys.
-            test_data_root (dict[Path]): Dictionary of paths to test data root directory or csv/parquet files with 
-                image-level data, with modalities as keys.
             means (dict[list]): Dictionary of mean values as lists with modalities as keys.
             stds (dict[list]): Dictionary of std values as lists with modalities as keys.
             task (str, optional): Selected task form segmentation, regression (pixel-wise), classification,
                 multilabel_classification, scalar_regression, scalar (custom image-level task), or None (no targets).
                 Defaults to None.
             num_classes (int, optional): Number of classes in classification or segmentation tasks.
-            predict_data_root (dict[Path], optional): Dictionary of paths to data root directory or csv/parquet files
-                with image-level data, with modalities as keys.
-            image_grep (dict[str], optional): Dictionary with regular expression appended to data_root to find input
-                images, with modalities as keys. Defaults to "*". Ignored when allow_substring_file_names is False.
-            label_grep (str, optional): Regular expression appended to label_data_root to find labels or mask files.
-                Defaults to "*". Ignored when allow_substring_file_names is False.
+            train_data_root (dict[Path] | str): Dictionary of paths to training data root directory or csv/parquet files
+                with image-level data, with modalities as keys. Can be string if paths are shared.
+            val_data_root (dict[Path] | str): Dictionary of paths to validation data root directory or csv/parquet files
+                with image-level data, with modalities as keys. Can be string if paths are shared.
+            test_data_root (dict[Path] | str | None): Dictionary of paths to test data root directory or csv/parquet
+                files with image-level data, with modalities as keys. Can be string if paths are shared.
+            predict_data_root (dict[Path], str, optional): Dictionary of paths to data root directory or csv/parquet
+                files with image-level data, with modalities as keys. Can be string if paths are shared.
+            data_root (dict[Path] | str, optional): Fallback if data root is shared for splits and not specified.
             train_label_data_root (Path | None, optional): Path to data root directory with training labels or
                 csv/parquet files with labels. Required for supervised tasks.
             val_label_data_root (Path | None, optional): Path to data root directory with validation labels or
                 csv/parquet files with labels. Required for supervised tasks.
             test_label_data_root (Path | None, optional): Path to data root directory with test labels or
                 csv/parquet files with labels. Required for supervised tasks.
+            label_data_root (Path | None, optional): Fallback if label data root is shared for splits and not specified.
+            image_grep (dict[str], optional): Dictionary with regular expression appended to data_root to find input
+                images, with modalities as keys. Defaults to "*". Ignored when allow_substring_file_names is False.
+            label_grep (str, optional): Regular expression appended to label_data_root to find labels or mask files.
+                Defaults to "*". Ignored when allow_substring_file_names is False.
             train_split (Path, optional): Path to file containing training samples prefixes to be used for this split.
                 The file can be a csv/parquet file with the prefixes in the index or a txt file with new-line separated
                 sample prefixes. File names must be exact matches if allow_substring_file_names is False. Otherwise,
@@ -312,6 +317,8 @@ class GenericMultiModalDataModule(NonGeoDataModule):
                 returning them. Defaults to False.
             data_with_sample_dim (bool): Use a specific collate function to concatenate samples along a existing sample
                 dimension instead of stacking the samples. Defaults to False.
+            allow_missing_modalities (bool): Experimental feature! Allow missing modalities during data loading.
+                Defaults to False.
             sample_num_modalities (int, optional): Load only a subset of modalities per batch. Defaults to None.
             sample_replace (bool): If sample_num_modalities is set, sample modalities with replacement.
                 Defaults to False.
@@ -344,31 +351,80 @@ class GenericMultiModalDataModule(NonGeoDataModule):
             self.non_image_modalities += ["label"]
 
         if img_grep is not None:
-            warnings.warn(f'img_grep was renamed to image_grep and will be removed in a future version.',
+            warnings.warn(f"img_grep was renamed to image_grep and will be removed in a future version.",
                           DeprecationWarning)
             image_grep = img_grep
 
         if isinstance(image_grep, dict):
+            # Check if image_grep is valid
+            for key, grep in image_grep.items():
+                if "*" not in grep:
+                    warnings.warn(f"image_grep requires a wildcard with a suffix. "
+                                  f"Adding '*' to image_grep[{key}]={grep}.")
+                    image_grep[key] = "*" + grep
+                if "*" in grep.strip("*/\\"):
+                    raise ValueError(f"GenericMultiModalDataModule can only handle image_grep with suffixes "
+                                     f"(e.g. '*_mod.tif'). Intermediate wildcards do not work, found {grep}.")
             self.image_grep = {m: image_grep[m] if m in image_grep else "*" for m in modalities}
         else:
-            self.image_grep = {m: image_grep or "*" for m in modalities}
-        self.label_grep = label_grep or "*"
-        self.train_root = train_data_root
-        self.val_root = val_data_root
-        self.test_root = test_data_root
-        self.train_label_data_root = train_label_data_root
-        self.val_label_data_root = val_label_data_root
-        self.test_label_data_root = test_label_data_root
-        self.predict_root = predict_data_root
+            image_grep = image_grep or "*"  # Handle None
+            if "*" not in image_grep:
+                warnings.warn(f"image_grep requires a wildcard with a suffix. Adding '*' to image_grep={image_grep}.")
+                image_grep = "*" + image_grep
+            if "*" in image_grep.strip("*/\\"):
+                raise ValueError(f"GenericMultiModalDataModule can only handle image_grep with suffixes "
+                                 f"(e.g. '*_mod.tif'). Intermediate wildcards do not work, found {image_grep}.")
+            self.image_grep = {m: image_grep for m in modalities}
+        label_grep = label_grep or "*"  # Handle None
+        # Check if label_grep is valid
+        if '*' not in label_grep:
+            warnings.warn(f"label_grep requires a wildcard with a suffix. Adding '*' to label_grep={label_grep}")
+            label_grep = "*" + label_grep
+        if "*" in label_grep.strip("*/\\"):
+            raise ValueError(f"GenericMultiModalDataModule can only handle label_grep with suffixes "
+                             f"(e.g. '*_mask.tif'). Intermediate wildcards do not work, found {label_grep}.")
+        self.label_grep = label_grep
+        self.train_label_data_root = train_label_data_root or label_data_root
+        self.val_label_data_root = val_label_data_root or label_data_root
+        self.test_label_data_root = test_label_data_root or label_data_root
+        if task is not None and (self.train_label_data_root is None or self.val_label_data_root is None):
+            raise ValueError(f"train_label_data_root and val_label_data_root (or label_data_root) "
+                             f"must be specified for task {task}.")
 
-        assert not train_data_root or all(m in train_data_root for m in modalities), \
-            f"predict_data_root is missing paths to some modalities {modalities}: {train_data_root}"
-        assert not val_data_root or all(m in val_data_root for m in modalities), \
-            f"predict_data_root is missing paths to some modalities {modalities}: {val_data_root}"
-        assert not test_data_root or all(m in test_data_root for m in modalities), \
-            f"predict_data_root is missing paths to some modalities {modalities}: {test_data_root}"
-        assert not predict_data_root or all(m in predict_data_root for m in modalities), \
-            f"predict_data_root is missing paths to some modalities {modalities}: {predict_data_root}"
+        if data_root is not None or label_data_root is not None:
+            if train_split is None or val_split is None or test_split is None:
+                warnings.warn(f"train_split, val_split, and test_split should be specified "
+                              f"if shared data_root/label_data_root is used to avoid data leakage.")
+
+        if isinstance(data_root, str):
+            data_root = {m: data_root for m in modalities}  # Convert default root into dict if provided
+
+        # Check paths and modalities for all splits
+        for name, split_root in [("train", train_data_root), ("val", val_data_root), ("test", test_data_root),
+                                ("predict", predict_data_root)]:
+            if split_root is None:
+                filtered = data_root
+            elif isinstance(split_root, str):
+                filtered = {m: split_root for m in modalities}
+            elif isinstance(split_root, dict):
+                filtered = {m: split_root[m] for m in modalities if m in split_root} # Filter out modalities not used
+                if not allow_missing_modalities:
+                    if not set(filtered.keys()) == set(modalities):
+                        raise ValueError(f"Paths in {name}_data_root do not match modalities {modalities}: {data_root}")
+            else:
+                raise ValueError(f"{name}_data_root is required to be either None, dict, or a str.")
+            if name == "train":
+                if filtered is None:
+                    raise ValueError(f"train_data_root or data_root must be specified as dict or string.")
+                self.train_root = filtered
+            elif name == "val":
+                if filtered is None:
+                    raise ValueError(f"val_data_root or data_root must be specified as dict or string.")
+                self.val_root = filtered
+            elif name == "test":
+                self.test_root = filtered
+            elif name == "predict":
+                self.predict_root = filtered
 
         self.train_split = train_split
         self.val_split = val_split
@@ -379,13 +435,18 @@ class GenericMultiModalDataModule(NonGeoDataModule):
         self.no_label_replace = no_label_replace
         self.drop_last = drop_last
         self.pin_memory = pin_memory
+        self.allow_missing_modalities = allow_missing_modalities
         self.sample_num_modalities = sample_num_modalities
-        self.sample_replace = sample_replace        
+        self.sample_replace = sample_replace
+        if allow_missing_modalities and batch_size > 1:
+            warnings.warn("allow_missing_modalities is set to True. This is an experimental feature."
+                          "Stacking is currently not supported, setting batch_size to 1.")
+            self.batch_size = 1
 
         self.dataset_bands = dataset_bands
         self.output_bands = output_bands
-        self.predict_dataset_bands = predict_dataset_bands
-        self.predict_output_bands = predict_output_bands
+        self.predict_dataset_bands = predict_dataset_bands or dataset_bands
+        self.predict_output_bands = predict_output_bands or output_bands
 
         self.rgb_modality = rgb_modality or modalities[0]
         self.rgb_indices = rgb_indices
@@ -393,8 +454,6 @@ class GenericMultiModalDataModule(NonGeoDataModule):
         self.reduce_zero_label = reduce_zero_label
         self.channel_position = channel_position
         self.concat_bands = concat_bands
-        if not concat_bands and check_stackability:
-            logger.debug(f"Cannot check stackability if bands are not concatenated.")
         self.check_stackability = check_stackability
 
         if isinstance(train_transform, dict):
@@ -458,6 +517,7 @@ class GenericMultiModalDataModule(NonGeoDataModule):
                 label_grep=self.label_grep,
                 label_data_root=self.train_label_data_root,
                 split=self.train_split,
+                allow_missing_modalities=self.allow_missing_modalities,
                 allow_substring_file_names=self.allow_substring_file_names,
                 dataset_bands=self.dataset_bands,
                 output_bands=self.output_bands,
@@ -483,6 +543,7 @@ class GenericMultiModalDataModule(NonGeoDataModule):
                 label_grep=self.label_grep,
                 label_data_root=self.val_label_data_root,
                 split=self.val_split,
+                allow_missing_modalities=self.allow_missing_modalities,
                 allow_substring_file_names=self.allow_substring_file_names,
                 dataset_bands=self.dataset_bands,
                 output_bands=self.output_bands,
@@ -508,6 +569,7 @@ class GenericMultiModalDataModule(NonGeoDataModule):
                 label_grep=self.label_grep,
                 label_data_root=self.test_label_data_root,
                 split=self.test_split,
+                allow_missing_modalities=self.allow_missing_modalities,
                 allow_substring_file_names=self.allow_substring_file_names,
                 dataset_bands=self.dataset_bands,
                 output_bands=self.output_bands,
@@ -528,10 +590,11 @@ class GenericMultiModalDataModule(NonGeoDataModule):
         if stage in ["predict"] and self.predict_root:
             self.predict_dataset = self.dataset_class(
                 data_root=self.predict_root,
+                label_data_root=None,  # Prediction mode
                 num_classes=self.num_classes,
                 image_grep=self.image_grep,
                 label_grep=self.label_grep,
-                allow_missing_modalities=True,
+                allow_missing_modalities=self.allow_missing_modalities,
                 allow_substring_file_names=self.allow_substring_file_names,
                 dataset_bands=self.predict_dataset_bands,
                 output_bands=self.predict_output_bands,
@@ -547,7 +610,6 @@ class GenericMultiModalDataModule(NonGeoDataModule):
                 channel_position=self.channel_position,
                 data_with_sample_dim=self.data_with_sample_dim,
                 concat_bands=self.concat_bands,
-                prediction_mode=True,
             )
             logger.info(f"Predict dataset: {len(self.predict_dataset)}")
 
@@ -567,7 +629,7 @@ class GenericMultiModalDataModule(NonGeoDataModule):
         dataset = self._valid_attribute(f"{split}_dataset", "dataset")
         batch_size = self._valid_attribute(f"{split}_batch_size", "batch_size")
 
-        if self.check_stackability:
+        if self.check_stackability and batch_size > 1:
             logger.info(f'Checking dataset stackability for {split} split')
             if self.concat_bands:
                 batch_size = check_dataset_stackability(dataset, batch_size)
